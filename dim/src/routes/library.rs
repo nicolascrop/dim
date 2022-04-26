@@ -7,11 +7,11 @@ use crate::tree;
 
 use auth::Wrapper as Auth;
 
+use database::compact_mediafile::CompactMediafile;
 use database::library::InsertableLibrary;
 use database::library::Library;
 use database::media::Media;
 use database::mediafile::MediaFile;
-use database::unmatched::UnmatchedMediafile;
 
 use events::Message;
 use events::PushEventType;
@@ -327,8 +327,16 @@ pub async fn get_all_unmatched_media(
     id: i64,
     _user: Auth,
 ) -> Result<impl warp::Reply, errors::DimError> {
-    let mut entry = tree::Entry::new();
     let mut tx = conn.read().begin().await?;
+
+    let mut files = CompactMediafile::unmatched_for_library(&mut tx, id)
+        .await
+        .map_err(|_| errors::DimError::NotFoundError)?;
+
+    let count = files.len();
+
+    // we want to pre-sort to ensure our tree is somewhat ordered.
+    files.sort_by(|a, b| a.target_file.cmp(&b.target_file));
 
     #[derive(Serialize)]
     struct Record {
@@ -338,40 +346,21 @@ pub async fn get_all_unmatched_media(
         file: String,
     }
 
-    let mut files = UnmatchedMediafile::all_for_library(&mut tx, id)
-        .await
-        .map_err(|_| errors::DimError::NotFoundError)?;
-
-    let count = files.len();
-
-    // we want to pre-sort to ensure our tree is somewhat ordered.
-    files.sort_by(|a, b| a.target_file.cmp(&b.target_file));
-
-    for file in files {
-        let mut components = file
-            .target_file
-            .iter()
-            .map(|x| x.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-
-        let filename = match components.pop() {
-            Some(x) => x,
-            None => continue,
-        };
-
-        entry.insert(
-            components.iter(),
-            Record {
-                id: file.id,
-                name: file.name,
-                duration: file.duration,
-                file: filename,
-            },
-        );
-    }
-
-    // remove root-directories with only one folder inside.
-    entry.compress();
+    let entry = tree::Entry::build_with(
+        files,
+        |x| {
+            x.target_file
+                .iter()
+                .map(|x| x.to_string_lossy().to_string())
+                .collect()
+        },
+        |k, v| Record {
+            id: v.id,
+            name: v.name,
+            duration: v.duration,
+            file: k.to_string(),
+        },
+    );
 
     #[derive(Serialize)]
     struct Response {
